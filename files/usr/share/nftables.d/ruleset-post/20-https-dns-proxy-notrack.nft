@@ -1,0 +1,7 @@
+table inet fw4 {
+    chain raw_output_https_dns_proxy {
+        type filter hook output priority raw; policy accept;
+        meta l4proto { tcp, udp } th dport { 5053, 5054 } ip daddr 127.0.0.0/8 notrack
+        meta l4proto { tcp, udp } th sport { 5053, 5054 } ip saddr 127.0.0.0/8 notrack
+    }
+}

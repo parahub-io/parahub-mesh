@@ -39,6 +39,7 @@ set network.vps_gateway.proto='wireguard'
 set network.vps_gateway.private_key='$(cat /etc/parahub/wg_vps_private.key)'
 set network.vps_gateway.mtu='1420'
 set network.vps_gateway.ip4table='100'
+set network.vps_gateway.nohostroute='1'
 BOOTSTRAP_NET
     uci commit network
 fi

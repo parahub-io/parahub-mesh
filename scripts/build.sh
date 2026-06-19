@@ -10,8 +10,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-OPENWRT_VERSION="${OPENWRT_VERSION:-25.12.0}"
-PARAHUB_BUILD="23"
+OPENWRT_VERSION="${OPENWRT_VERSION:-25.12.3}"
+PARAHUB_BUILD="30"
 FIRMWARE_VERSION="${OPENWRT_VERSION}-ph${PARAHUB_BUILD}"
 
 # ============================================================================
@@ -77,8 +77,9 @@ device_config() {
 PACKAGES_BEE=(
     kmod-batman-adv
     batctl-full
-    wpad-mesh-mbedtls
+    wpad-mesh-openssl
     -wpad-basic-mbedtls
+    -wpad-mesh-mbedtls
     yggdrasil
     tc-full
     kmod-ifb
@@ -91,8 +92,9 @@ PACKAGES_BEE=(
 PACKAGES_BUMBLEBEE=(
     kmod-batman-adv
     batctl-full
-    wpad-mesh-mbedtls
+    wpad-mesh-openssl
     -wpad-basic-mbedtls
+    -wpad-mesh-mbedtls
     yggdrasil
     kmod-gre6
     kmod-wireguard

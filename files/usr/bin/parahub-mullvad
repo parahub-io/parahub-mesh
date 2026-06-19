@@ -140,6 +140,7 @@ set network.mullvad_local.private_key='${PRIVKEY}'
 add_list network.mullvad_local.addresses='${MULLVAD_IPV4}'
 set network.mullvad_local.mtu='1420'
 set network.mullvad_local.ip4table='100'
+set network.mullvad_local.nohostroute='1'
 
 add network wireguard_mullvad_local
 set network.@wireguard_mullvad_local[-1].public_key='${SERVER_PUBKEY}'
@@ -188,10 +189,15 @@ MULLVAD_LOCAL_IP=${MULLVAD_IPV4}
 ACCT_EOF
     chmod 600 "$ACCOUNT_FILE"
 
-    # --- Step 8: Apply ---
-    echo "Restarting network..."
-    /etc/init.d/network restart
-    /etc/init.d/firewall restart
+    # --- Step 8: Apply (targeted, non-disruptive) ---
+    # Reload netifd config without restart (preserves Yggdrasil/SSH sessions)
+    ubus call network reload 2>/dev/null || /etc/init.d/network reload
+    sleep 1
+    # Bring down VPS gateway (Mullvad replaces it), bring up new Mullvad interface
+    ifdown vps_gateway 2>/dev/null
+    ifup mullvad_local
+    # Reload firewall (non-destructive — applies new zone/forwarding without flushing)
+    fw4 reload 2>/dev/null || /etc/init.d/firewall reload
 
     echo ""
     echo "Done! Guest traffic now routes directly through Mullvad."
@@ -265,9 +271,12 @@ cmd_remove() {
     # Clean up files
     rm -f "$PARAHUB_DIR/wg_private.key" "$PARAHUB_DIR/wg_public.key" "$ACCOUNT_FILE"
 
-    echo "Restarting network..."
-    /etc/init.d/network restart
-    /etc/init.d/firewall restart
+    # Targeted, non-disruptive (preserves Yggdrasil/SSH)
+    ifdown mullvad_local 2>/dev/null
+    ubus call network reload 2>/dev/null || /etc/init.d/network reload
+    sleep 1
+    ifup vps_gateway 2>/dev/null
+    fw4 reload 2>/dev/null || /etc/init.d/firewall reload
 
     echo "Done! Guest traffic now routes through VPS gateway."
 }

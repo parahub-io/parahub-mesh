@@ -15,7 +15,7 @@ ANYCAST_GW="10.250.250.1"
 CURRENT_STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
 # Read own subnets from /etc/parahub/keys
-# Provides: GUEST_SUBNET (e.g. "10.131.196.0/24")
+# Provides: GUEST_SUBNET (e.g. "10.131.196.0/24"), PRIVATE_SUBNET (e.g. "10.236.248.0/24")
 . /etc/parahub/keys 2>/dev/null
 
 # Detect guest interface name
@@ -59,7 +59,12 @@ if [ "$WG_OK" = "1" ]; then
     # Clean up mesh fallback if was active
     if [ "$CURRENT_STATE" = "mesh_fallback" ]; then
         cleanup_mesh_fallback
-        logger -t parahub-gw "WireGuard restored, removed mesh fallback"
+        # cleanup_mesh_fallback removed the mesh-fallback default; restore the
+        # active WG's default in table 100 (netifd added it at ifup but the
+        # earlier 'ip route replace' during fallback overwrote it).
+        ACTIVE_WG=$(wg show all latest-handshakes 2>/dev/null | sort -k3 -rn | awk 'NR==1{print $1}')
+        [ -n "$ACTIVE_WG" ] && ip route replace default dev "$ACTIVE_WG" table 100
+        logger -t parahub-gw "WireGuard restored, removed mesh fallback (table 100 → $ACTIVE_WG)"
     fi
 
     CURRENT_MODE=$(batctl gw_mode 2>/dev/null | awk '{print $1}')
@@ -149,11 +154,14 @@ if [ "$CURRENT_STATE" != "mesh_fallback" ] || [ "$OLD_GW" != "$GW_IP" ]; then
     ip route replace default via "$GW_IP" dev br-private table 100
     ip route replace default via "$GW_IP" dev br-private metric 500
 
-    # Masquerade guest traffic to br-private IP (gateway only knows mesh L2 addresses)
+    # Masquerade guest + private traffic to br-private IP (gateway only knows mesh L2 addresses).
+    # Without private SNAT, Parahub clients (10.P1.P2.x) hit the mesh peer with their own src,
+    # peer has no return route → reply lost → "no internet on Parahub WiFi".
     nft add table inet mesh_gw_fallback 2>/dev/null
     nft flush table inet mesh_gw_fallback
     nft add chain inet mesh_gw_fallback postrouting '{ type nat hook postrouting priority 100; }'
     nft add rule inet mesh_gw_fallback postrouting oifname "br-private" ip saddr "$GUEST_SUBNET" masquerade
+    [ -n "$PRIVATE_SUBNET" ] && nft add rule inet mesh_gw_fallback postrouting oifname "br-private" ip saddr "$PRIVATE_SUBNET" masquerade
 
     # Allow guest→br-private forwarding (blocked by reject_to_lan in forward_guest)
     if [ -n "$GUEST_IFACE" ]; then

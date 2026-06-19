@@ -143,8 +143,11 @@ else
             WAN_DEV="$port"
         fi
     done
-    [ -z "$LAN_PORTS" ] && LAN_PORTS="eth0"
-    [ -z "$WAN_DEV" ] && WAN_DEV="eth1"
+    # Fallbacks must NOT collide with each other — single-port devices (e.g. AP3000 Outdoor:
+    # port_map="eth0:wan") have only WAN, no LAN ethernet. Putting eth0 in both WAN and the
+    # private bridge mostly L2 with WAN → clients pick up provider DHCP.
+    [ -z "$LAN_PORTS" ] && [ "$WAN_DEV" != "eth0" ] && LAN_PORTS="eth0"
+    [ -z "$WAN_DEV" ] && [ "$LAN_PORTS" != "eth1" ] && WAN_DEV="eth1"
 fi
 
 # Delete default OpenWrt br-lan/lan (conflicts with our br-private)
@@ -275,6 +278,7 @@ set network.vps_gateway.private_key='$(cat /etc/parahub/wg_vps_private.key)'
 set network.vps_gateway.mtu='1420'
 set network.vps_gateway.ip4table='100'
 set network.vps_gateway.auto='0'
+set network.vps_gateway.nohostroute='1'
 
 # --- Policy routing: guest traffic → table 100 ---
 add network rule
@@ -372,6 +376,12 @@ set wireless.mesh_2g.key='${MESH_KEY}'
 set wireless.mesh_2g.network='bat0_hardif_mesh0'
 WIFI_2G_MESH
 
+    # parahub.io/free is OPEN (no encryption) — workaround for OpenWrt 25.12.x
+    # OWE bug. OWE config makes hostapd add_iface fail at boot on filogic +
+    # qualcommax + ramips, killing the entire 2.4GHz radio (incl. private SSID).
+    # TODO: revert encryption='owe' once upstream fixes it (incident 2026-05-06,
+    # ph29). Verify via test build: encryption='owe' → hostapd phy0-ap0 ENABLED
+    # in logread, iwinfo phy0-ap0 shows real channel (not 0/unknown).
     if [ "$ROLE" = "bee" ]; then
         # Bee: parahub.io/free on private bridge (no guest isolation)
         uci batch <<-WIFI_2G_PUB
@@ -379,8 +389,7 @@ set wireless.public_2g=wifi-iface
 set wireless.public_2g.device='${RADIO_2G}'
 set wireless.public_2g.mode='ap'
 set wireless.public_2g.ssid='${PUBLIC_SSID}'
-set wireless.public_2g.encryption='owe'
-set wireless.public_2g.owe_transition='1'
+set wireless.public_2g.encryption='none'
 set wireless.public_2g.network='private'
 WIFI_2G_PUB
     else
@@ -390,8 +399,7 @@ set wireless.public_2g=wifi-iface
 set wireless.public_2g.device='${RADIO_2G}'
 set wireless.public_2g.mode='ap'
 set wireless.public_2g.ssid='${PUBLIC_SSID}'
-set wireless.public_2g.encryption='owe'
-set wireless.public_2g.owe_transition='1'
+set wireless.public_2g.encryption='none'
 set wireless.public_2g.isolate='1'
 set wireless.public_2g.network='guest'
 WIFI_2G_PUB
@@ -719,19 +727,21 @@ fi
 # ============================================================================
 
 if [ "$ROLE" != "bee" ]; then
-    # Disable https-dns-proxy (DoH causes DNS leak — resolver IP differs from VPN exit)
-    /etc/init.d/https-dns-proxy stop 2>/dev/null || true
-    /etc/init.d/https-dns-proxy disable 2>/dev/null || true
-
-    # Forward DNS to VPS unbound (10.99.0.1) via WireGuard tunnel.
-    # VPS resolves recursively from its own IP = same as VPN exit = no DNS leak.
+    # DNS resolver chain (parallel query — dnsmasq picks first responder):
+    #   1. 10.99.0.1   — VPS unbound via vps_gateway WG (no DNS leak; preferred when up)
+    #   2. 127.0.0.1#5053/5054 — DoH (cloudflare/google) via https-dns-proxy as fallback
+    # Without DoH fallback, when vps_gateway is down (no peer / pre-provisioning) DNS dies
+    # entirely and the router becomes unusable for clients.
     uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null || true
-    uci -q delete dhcp.@dnsmasq[0].doh_server 2>/dev/null || true
-    uci -q delete dhcp.@dnsmasq[0].doh_backup_server 2>/dev/null || true
-    uci -q delete dhcp.@dnsmasq[0].doh_backup_noresolv 2>/dev/null || true
     uci add_list dhcp.@dnsmasq[0].server='10.99.0.1'
     uci set dhcp.@dnsmasq[0].noresolv='1'
     uci commit dhcp
+
+    # https-dns-proxy auto-injects 127.0.0.1#5053/5054 into dnsmasq config on start.
+    # NoTrack rules dir is missing on some 25.12.x targets — pre-create to avoid noise.
+    mkdir -p /usr/share/nftables.d/ruleset-post
+    /etc/init.d/https-dns-proxy enable 2>/dev/null || true
+    /etc/init.d/https-dns-proxy start 2>/dev/null || true
 fi
 
 # Route parahub.io to Yggdrasil IPv6 (all roles: mesh traffic stays in-network)
@@ -891,8 +901,9 @@ PRIV6_EOF
     nft add chain ip6 parahub_nat66 postrouting '{ type nat hook postrouting priority 100; policy accept; }'
     nft add rule ip6 parahub_nat66 postrouting oifname "ygg0" masquerade
 
-    # Guest needs a ULA address for IPv6 connectivity (source for NAT66)
-    uci set network.guest.ip6addr="fd00:para:guest::1/64"
+    # Guest needs a ULA address for IPv6 connectivity (source for NAT66).
+    # IPv6 groups must be hex — "fd00:para:guest" was rejected by netifd as INVALID_ADDRESS.
+    uci set network.guest.ip6addr="fd00:bee5::1/64"
     uci commit network
 
     uci batch <<-GUEST6_EOF

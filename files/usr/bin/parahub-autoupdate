@@ -31,18 +31,36 @@ if [ -z "$CURRENT_VERSION" ] || [ -z "$DEVICE_PROFILE" ]; then
     exit 1
 fi
 
+# Bee uplink (Yggdrasil peer + WAN fallback) goes through bumblebee neighbor.
+# Bumblebees flash at 03:15 and are unreachable for ~5 min — bee must wait until
+# they're back before fetching manifest, otherwise both ygg and public fail.
+if [ "$ROLE" = "bee" ]; then
+    logger -t parahub-update "Bee role — sleeping 30min so bumblebee neighbors finish OTA first"
+    sleep 1800
+    YGG_RETRIES=10
+    YGG_RETRY_DELAY=120
+else
+    YGG_RETRIES=3
+    YGG_RETRY_DELAY=60
+fi
+
 # Random delay to spread update load across nodes (0-5 min)
 sleep $((RANDOM % 300))
 
 # Fetch manifest (Yggdrasil first with retries, public fallback)
 MANIFEST=""
-for attempt in 1 2 3; do
+attempt=1
+while [ "$attempt" -le "$YGG_RETRIES" ]; do
     if ping6 -c 1 -W 3 <YGG_ADDR_MAIN> >/dev/null 2>&1; then
         MANIFEST=$(curl -s -m 30 "$MANIFEST_YGG" 2>/dev/null)
         BASE_URL="$FIRMWARE_YGG"
     fi
     [ -n "$MANIFEST" ] && break
-    [ "$attempt" -lt 3 ] && logger -t parahub-update "Yggdrasil unavailable, retry ${attempt}/3 in 60s..." && sleep 60
+    if [ "$attempt" -lt "$YGG_RETRIES" ]; then
+        logger -t parahub-update "Yggdrasil unavailable, retry ${attempt}/${YGG_RETRIES} in ${YGG_RETRY_DELAY}s..."
+        sleep "$YGG_RETRY_DELAY"
+    fi
+    attempt=$((attempt + 1))
 done
 
 if [ -z "$MANIFEST" ]; then
