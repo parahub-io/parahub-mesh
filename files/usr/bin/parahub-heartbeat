@@ -9,7 +9,7 @@ ROLE=$(cat /etc/parahub/role 2>/dev/null || echo "unknown")
 
 # Read identity from /etc/parahub/keys
 . /etc/parahub/keys 2>/dev/null
-MAC="${NODE_MAC:-$(cat /sys/class/net/br-lan/address 2>/dev/null)}"
+MAC="${NODE_MAC:-$(cat /sys/class/net/br-private/address 2>/dev/null)}"
 HOSTNAME="$(uci -q get system.@system[0].hostname)"
 YGG_ADDR="${YGGDRASIL_ADDRESS:-unknown}"
 SSID="${PRIVATE_SSID:-unknown}"
@@ -42,7 +42,9 @@ case "$HW" in
     xiaomi,redmi-router-ax6s) HW="ax6s" ;;
     asus,rt-ax53u) HW="ax53u" ;;
     glinet,gl-ar300m16) HW="ar300m16" ;;
+    cudy,ap3000outdoor-v1) HW="ap3000outdoor" ;;
     cudy,wr3000-v1) HW="wr3000" ;;
+    tplink,cpe710-v1) HW="cpe710" ;;
     *) HW="${HW:-unknown}" ;;
 esac
 
@@ -53,14 +55,42 @@ VPN_MODE="none"
 [ -f /etc/parahub/mullvad_account ] && VPN_MODE="mullvad"
 [ "$VPN_MODE" = "none" ] && wg show vps_gateway 2>/dev/null | grep -q 'latest handshake' && VPN_MODE="vps"
 
-PAYLOAD="{\"mac\":\"${MAC}\",\"hostname\":\"${HOSTNAME}\",\"yggdrasil_address\":\"${YGG_ADDR}\",\"firmware_version\":\"${FW_VERSION}\",\"hardware_profile\":\"${HW}\",\"uptime\":${UPTIME},\"private_ssid\":\"${SSID}\",\"firmware_role\":\"${ROLE}\",\"mesh_ip\":\"${MESH_IP}\",\"wg_public_key\":\"${WG_PUBKEY}\",\"vpn_mode\":\"${VPN_MODE}\"}"
+# Mesh topology for per-island guest-gateway election (ph37): this node's own
+# mesh interface MACs + every originator MAC it sees. batctl o is the full
+# island view (multi-hop), so the backend can join two nodes into one island
+# whenever one's mesh MAC appears in the other's originator set — a node with
+# an empty originator set is its own island.
+MESH_MACS=""
+for IF in $(batctl if 2>/dev/null | cut -d: -f1); do
+    IF_MAC=$(cat /sys/class/net/$IF/address 2>/dev/null)
+    [ -n "$IF_MAC" ] && MESH_MACS="${MESH_MACS}${MESH_MACS:+,}\"${IF_MAC}\""
+done
+MESH_ORIGINATORS=$(batctl o 2>/dev/null | awk '
+    { mac = ($1 == "*") ? $2 : $1
+      if (mac ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/ && !seen[mac]++) printf "%s\"%s\"", (n++ ? "," : ""), mac }')
+
+PAYLOAD="{\"mac\":\"${MAC}\",\"hostname\":\"${HOSTNAME}\",\"yggdrasil_address\":\"${YGG_ADDR}\",\"firmware_version\":\"${FW_VERSION}\",\"hardware_profile\":\"${HW}\",\"uptime\":${UPTIME},\"private_ssid\":\"${SSID}\",\"firmware_role\":\"${ROLE}\",\"mesh_ip\":\"${MESH_IP}\",\"wg_public_key\":\"${WG_PUBKEY}\",\"vpn_mode\":\"${VPN_MODE}\",\"mesh_macs\":[${MESH_MACS}],\"mesh_originators\":[${MESH_ORIGINATORS}]}"
 
 RESPONSE=""
 
 if [ "$ROLE" = "bee" ]; then
-    # Bee: ensure internet reachability via batman-adv gateway when no WAN
-    # Note: BusyBox "ip route show default" may return all routes — use grep filter
-    if ! ip route 2>/dev/null | grep -q '^default'; then
+    # Bee: ensure internet reachability via batman-adv gateway when no WAN.
+    # Note: BusyBox "ip route show default" may return all routes — use grep filter.
+    # Re-derive when there is no default at all, OR when our only default is a
+    # mesh one (via br-private) whose gateway has gone unreachable (e.g. the
+    # serving bumblebee moved to a different MAC-derived IP). Without the reach
+    # test a bee keeps a dead mesh default until reboot. The derive below uses
+    # `ip route replace`, so a live re-derive swaps atomically and a failed one
+    # leaves the existing default untouched — no regression.
+    NEED_GW=0
+    DEF_LINE=$(ip route 2>/dev/null | grep '^default' | head -1)
+    if [ -z "$DEF_LINE" ]; then
+        NEED_GW=1
+    elif echo "$DEF_LINE" | grep -q 'br-private'; then
+        CUR_GW=$(echo "$DEF_LINE" | awk '{print $3}')
+        [ -n "$CUR_GW" ] && ! ping -c 1 -W 3 "$CUR_GW" >/dev/null 2>&1 && NEED_GW=1
+    fi
+    if [ "$NEED_GW" = "1" ]; then
         ANYCAST_GW="10.250.250.1"
         GW_IP=""
 
@@ -149,6 +179,18 @@ if [ "$ROLE" != "bee" ] && [ -x /usr/bin/parahub-ygg-acl ] && [ -n "$RESPONSE" ]
     nft list table inet parahub_ygg >/dev/null 2>&1 || parahub-ygg-acl init
     # Sync allowed set
     parahub-ygg-acl sync $YGG_IPS
+fi
+
+# Sync guest-VLAN gateway role (Bumblebee only, ph35). The backend elects exactly
+# one bumblebee to terminate the mesh guest VLAN; this node obeys the flag. An
+# absent/false flag means relay-only (fail-safe: no DHCP race, no un-VPN'd hole).
+if [ "$ROLE" != "bee" ] && [ -x /usr/bin/parahub-guest-gateway ] && [ -n "$RESPONSE" ]; then
+    GUEST_GW=$(echo "$RESPONSE" | jsonfilter -e '$.guest_gateway' 2>/dev/null)
+    if [ "$GUEST_GW" = "true" ]; then
+        parahub-guest-gateway on
+    else
+        parahub-guest-gateway off
+    fi
 fi
 
 # VPS gateway auto-configuration (Bumblebee only, skip if Mullvad is configured)

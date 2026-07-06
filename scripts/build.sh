@@ -10,9 +10,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-OPENWRT_VERSION="${OPENWRT_VERSION:-25.12.3}"
-PARAHUB_BUILD="30"
+OPENWRT_VERSION="${OPENWRT_VERSION:-25.12.5}"
+PARAHUB_BUILD="${PARAHUB_BUILD:-37}"
 FIRMWARE_VERSION="${OPENWRT_VERSION}-ph${PARAHUB_BUILD}"
+
+# Where built images + manifest land. Override (OUTPUT_DIR=/path ./build.sh ...)
+# to stage a build without touching the live output/ the fleet OTAs from — the
+# image filenames only encode OPENWRT_VERSION, so two PARAHUB_BUILD numbers on
+# the same base collide in one dir and break the published manifest's SHAs.
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/output}"
 
 # ============================================================================
 # Device Database (device → target/subtarget + Image Builder profile)
@@ -205,29 +211,29 @@ build_firmware() {
         PROFILE="$PROFILE" \
         PACKAGES="$packages" \
         FILES="$tmpfiles" \
-        BIN_DIR="${PROJECT_DIR}/output"
+        BIN_DIR="${OUTPUT_DIR}"
 
     rm -rf "$tmpfiles"
 
     # Ensure output files are world-readable (served by nginx)
-    chmod 644 "${PROJECT_DIR}/output/"* 2>/dev/null || true
+    chmod 644 "${OUTPUT_DIR}/"* 2>/dev/null || true
 
     echo ""
     echo "Build complete! Firmware images:"
-    ls -lh "${PROJECT_DIR}/output/"*.bin 2>/dev/null || true
-    ls -lh "${PROJECT_DIR}/output/"*.img* 2>/dev/null || true
-    ls -lh "${PROJECT_DIR}/output/"*.itb 2>/dev/null || true
+    ls -lh "${OUTPUT_DIR}/"*.bin 2>/dev/null || true
+    ls -lh "${OUTPUT_DIR}/"*.img* 2>/dev/null || true
+    ls -lh "${OUTPUT_DIR}/"*.itb 2>/dev/null || true
 
     # Update manifest.json with this device's sysupgrade info
     update_manifest
 }
 
 update_manifest() {
-    local manifest="${PROJECT_DIR}/output/manifest.json"
+    local manifest="${OUTPUT_DIR}/manifest.json"
     local sysupgrade_file sha256
 
     # Find the sysupgrade.bin for this profile
-    sysupgrade_file=$(ls -t "${PROJECT_DIR}/output/"*"${PROFILE}"*-sysupgrade.bin 2>/dev/null | head -1)
+    sysupgrade_file=$(ls -t "${OUTPUT_DIR}/"*"${PROFILE}"*-sysupgrade.bin 2>/dev/null | head -1)
 
     if [ -z "$sysupgrade_file" ]; then
         echo "Warning: No sysupgrade.bin found for ${PROFILE}, skipping manifest update"

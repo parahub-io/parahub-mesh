@@ -1,8 +1,8 @@
 #!/bin/sh
 # Parahub Gateway Health Check
 # 3-state logic:
-#   1. WG active → gw_mode=server (advertise as gateway, send GARP)
-#   2. WG down + mesh gateway found → gw_mode=client + fallback routing through mesh
+#   1. WG active + own uplink → gw_mode=server (advertise as gateway, send GARP)
+#   2. WG down (or no own uplink) + mesh gateway found → gw_mode=client + fallback routing through mesh
 #   3. WG down + no mesh gateway → gw_mode=client (isolated, no guest internet)
 #
 # Run via cron every 2 minutes. Bumblebee only.
@@ -12,6 +12,11 @@
 STATE_FILE="/tmp/mesh_gw_state"
 GW_IP_FILE="/tmp/mesh_gw_ip"
 ANYCAST_GW="10.250.250.1"
+# fw4 auto-includes chain-pre/<chain>/*.nft at the top of that chain on every
+# firewall reload. Rules inserted live into fw4 chains do NOT survive reloads
+# (fw4 regenerates its table from scratch), and reloads happen behind our back:
+# the https-dns-proxy restart below triggers one via procd_set_config_changed.
+FW_INCLUDE="/usr/share/nftables.d/chain-pre/forward_guest/30-mesh-gw-fallback.nft"
 CURRENT_STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "unknown")
 
 # Read own subnets from /etc/parahub/keys
@@ -33,6 +38,57 @@ if command -v wg >/dev/null 2>&1; then
     fi
 fi
 
+# A handshake achieved through the mesh fallback itself must not promote this
+# node to server: without an own uplink, server mode tears down the fallback
+# default route, the WG endpoint becomes unreachable again and guests get
+# blackholed until the handshake goes stale — a permanent ~8 min
+# server↔mesh_fallback oscillation (WAN-less FC10 incident, 2026-07-04). Only
+# trust the handshake if a default route exists that does not go via the mesh.
+if [ "$WG_OK" = "1" ]; then
+    if ! ip -4 route 2>/dev/null | grep '^default' | grep -qv 'br-private'; then
+        WG_OK=0
+        [ "$CURRENT_STATE" = "server" ] && logger -t parahub-gw "WG handshake fresh but no own uplink (default route only via mesh), demoting to client"
+    fi
+fi
+
+# ---- Guest forward rule (guest→br-private, otherwise hit by reject_to_lan) ----
+guest_forward_rule_present() {
+    [ -f "$FW_INCLUDE" ] && return 0
+    nft list chain inet fw4 forward_guest 2>/dev/null | grep -q 'mesh-gw-fallback'
+}
+
+install_guest_forward_rule() {
+    if [ -z "$GUEST_IFACE" ]; then
+        logger -t parahub-gw "WARNING: guest interface unknown (ubus), cannot ensure guest forward rule"
+        return
+    fi
+    # Scope the fallback opening to non-local destinations. Guests must reach the
+    # mesh gateway (a different 10.x/24) and the internet beyond it, but NOT this
+    # node's own private LAN — an unscoped accept silently drops guest<->LAN
+    # isolation for the whole fallback episode (permanent on WAN-less extenders,
+    # ph31+). The gateway and internet are outside PRIVATE_SUBNET, so excluding
+    # it keeps fallback working while restoring isolation.
+    local excl=""
+    [ -n "$PRIVATE_SUBNET" ] && excl="ip daddr != $PRIVATE_SUBNET "
+    local rule="iifname \"$GUEST_IFACE\" oifname \"br-private\" ${excl}accept comment \"mesh-gw-fallback\""
+    if [ "$(cat "$FW_INCLUDE" 2>/dev/null)" != "$rule" ]; then
+        mkdir -p "${FW_INCLUDE%/*}"
+        echo "$rule" > "$FW_INCLUDE"
+    fi
+    if ! nft list chain inet fw4 forward_guest 2>/dev/null | grep -q 'mesh-gw-fallback'; then
+        nft insert rule inet fw4 forward_guest iifname "$GUEST_IFACE" oifname "br-private" ${excl}accept comment \"mesh-gw-fallback\"
+        logger -t parahub-gw "Installed guest forward rule for mesh fallback (iface $GUEST_IFACE)"
+    fi
+}
+
+remove_guest_forward_rule() {
+    rm -f "$FW_INCLUDE"
+    local h
+    for h in $(nft -a list chain inet fw4 forward_guest 2>/dev/null | grep 'mesh-gw-fallback' | awk '{print $NF}'); do
+        nft delete rule inet fw4 forward_guest handle "$h"
+    done
+}
+
 # ---- Cleanup mesh fallback routing ----
 cleanup_mesh_fallback() {
     local old_gw
@@ -41,10 +97,7 @@ cleanup_mesh_fallback() {
     # Remove mesh fallback nftables table (masquerade)
     nft delete table inet mesh_gw_fallback 2>/dev/null
 
-    # Remove forward rule from fw4 by comment
-    local handle
-    handle=$(nft -a list chain inet fw4 forward_guest 2>/dev/null | grep 'mesh-gw-fallback' | awk '{print $NF}')
-    [ -n "$handle" ] && nft delete rule inet fw4 forward_guest handle "$handle"
+    remove_guest_forward_rule
 
     # Remove mesh default routes and host route to gateway
     [ -n "$old_gw" ] && ip route del default via "$old_gw" dev br-private table 100 2>/dev/null
@@ -65,6 +118,11 @@ if [ "$WG_OK" = "1" ]; then
         ACTIVE_WG=$(wg show all latest-handshakes 2>/dev/null | sort -k3 -rn | awk 'NR==1{print $1}')
         [ -n "$ACTIVE_WG" ] && ip route replace default dev "$ACTIVE_WG" table 100
         logger -t parahub-gw "WireGuard restored, removed mesh fallback (table 100 → $ACTIVE_WG)"
+    elif guest_forward_rule_present; then
+        # Stale after a reboot mid-fallback (/tmp state lost): the include
+        # would keep re-opening guest→private on every firewall reload.
+        remove_guest_forward_rule
+        logger -t parahub-gw "Removed stale mesh fallback guest forward rule"
     fi
 
     CURRENT_MODE=$(batctl gw_mode 2>/dev/null | awk '{print $1}')
@@ -105,6 +163,8 @@ if [ -z "$GW_MAC" ]; then
     if [ "$CURRENT_STATE" = "mesh_fallback" ]; then
         cleanup_mesh_fallback
         logger -t parahub-gw "Mesh gateway lost, guest internet disabled"
+    elif guest_forward_rule_present; then
+        remove_guest_forward_rule
     fi
     echo "isolated" > "$STATE_FILE"
     exit 0
@@ -131,6 +191,8 @@ if ! ping -c 1 -W 2 "$GW_IP" >/dev/null 2>&1; then
         ip route del "$ANYCAST_GW/32" dev br-private 2>/dev/null
         if [ "$CURRENT_STATE" = "mesh_fallback" ]; then
             cleanup_mesh_fallback
+        elif guest_forward_rule_present; then
+            remove_guest_forward_rule
         fi
         logger -t parahub-gw "Mesh gateway unreachable (MAC-derived + anycast), skipping fallback"
         echo "isolated" > "$STATE_FILE"
@@ -149,28 +211,35 @@ fi
 
 echo "$GW_IP" > "$GW_IP_FILE"
 
-if [ "$CURRENT_STATE" != "mesh_fallback" ] || [ "$OLD_GW" != "$GW_IP" ]; then
-    # Set up routing: table 100 for guest policy routing + main table for router's own traffic (DoH, NTP)
-    ip route replace default via "$GW_IP" dev br-private table 100
-    ip route replace default via "$GW_IP" dev br-private metric 500
+# Routing, NAT and the guest forward rule are (re)asserted on EVERY tick, not
+# only on the state transition: fw4 reloads drop the live forward rule, netifd
+# events on vps_gateway (ip4table=100) can clobber the table-100 default, and
+# a one-shot setup left any such loss unrepaired for the rest of the episode.
+# Everything below is idempotent.
+ip route replace default via "$GW_IP" dev br-private table 100
+ip route replace default via "$GW_IP" dev br-private metric 500
 
-    # Masquerade guest + private traffic to br-private IP (gateway only knows mesh L2 addresses).
-    # Without private SNAT, Parahub clients (10.P1.P2.x) hit the mesh peer with their own src,
-    # peer has no return route → reply lost → "no internet on Parahub WiFi".
-    nft add table inet mesh_gw_fallback 2>/dev/null
-    nft flush table inet mesh_gw_fallback
+# Masquerade guest + private traffic to br-private IP (gateway only knows mesh L2 addresses).
+# Without private SNAT, Parahub clients (10.P1.P2.x) hit the mesh peer with their own src,
+# peer has no return route → reply lost → "no internet on Parahub WiFi".
+if ! nft list table inet mesh_gw_fallback >/dev/null 2>&1; then
+    nft add table inet mesh_gw_fallback
     nft add chain inet mesh_gw_fallback postrouting '{ type nat hook postrouting priority 100; }'
-    nft add rule inet mesh_gw_fallback postrouting oifname "br-private" ip saddr "$GUEST_SUBNET" masquerade
-    [ -n "$PRIVATE_SUBNET" ] && nft add rule inet mesh_gw_fallback postrouting oifname "br-private" ip saddr "$PRIVATE_SUBNET" masquerade
+fi
+# Re-assert the SNAT rules every tick (idempotent). Under the old create-once
+# gate, a table first created while the subnet vars were empty stayed ruleless
+# forever, silently killing fallback egress. Flushing only affects NEW flows in
+# a sub-ms window; conntrack keeps the NAT binding for established connections.
+nft flush chain inet mesh_gw_fallback postrouting 2>/dev/null
+[ -n "$GUEST_SUBNET" ] && nft add rule inet mesh_gw_fallback postrouting oifname "br-private" ip saddr "$GUEST_SUBNET" masquerade
+[ -n "$PRIVATE_SUBNET" ] && nft add rule inet mesh_gw_fallback postrouting oifname "br-private" ip saddr "$PRIVATE_SUBNET" masquerade
 
-    # Allow guest→br-private forwarding (blocked by reject_to_lan in forward_guest)
-    if [ -n "$GUEST_IFACE" ]; then
-        if ! nft list chain inet fw4 forward_guest 2>/dev/null | grep -q 'mesh-gw-fallback'; then
-            nft insert rule inet fw4 forward_guest iifname "$GUEST_IFACE" oifname "br-private" accept comment \"mesh-gw-fallback\"
-        fi
-    fi
+install_guest_forward_rule
 
-    # Restart DoH proxy — it may have stopped when WAN was down
+if [ "$CURRENT_STATE" != "mesh_fallback" ] || [ "$OLD_GW" != "$GW_IP" ]; then
+    # Restart DoH proxy — it may have stopped when WAN was down.
+    # NB: its init triggers an async fw4 reload (procd_set_config_changed
+    # firewall) — survivable now that the forward rule ships as an include.
     /etc/init.d/https-dns-proxy restart 2>/dev/null
 
     logger -t parahub-gw "Mesh fallback active via gateway $GW_IP (MAC $GW_MAC)"

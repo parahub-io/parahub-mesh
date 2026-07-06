@@ -1,0 +1,53 @@
+#!/bin/sh
+# parahub-guest-gateway <on|off>
+# ph35: toggle whether THIS bumblebee runs the guest-VLAN (bat0.10) DHCP server.
+#
+#   on  = elected terminator: serve guest DHCP. Free/guest clients from anywhere
+#         on the mesh get a lease in this node's guest subnet and exit via its
+#         VPN (guest zone -> vps_gateway/mullvad, table 100).
+#   off = do NOT serve guest DHCP; free clients ride bat0.10 across the mesh to
+#         whichever bumblebee IS elected.
+#
+# Every bumblebee keeps its guest IP + guest->VPN forwarding regardless (set in
+# uci-defaults), so a node can be promoted instantly and, when demoted, its
+# existing clients keep working until their lease expires while new clients get
+# the newly-elected node's subnet.
+#
+# The backend heartbeat elects exactly one gateway (only ph35+ bumblebees with
+# an active VPN are eligible) and reports it via the `guest_gateway` flag;
+# parahub-heartbeat calls this helper. batman-adv's gw_mode arbitrates DHCP on
+# the untagged bat0 but NOT on a tagged sub-interface, so a single elected DHCP
+# server is what keeps bumblebees from racing DHCP on the one shared guest VLAN.
+# Only touches dnsmasq when the state actually changes.
+
+STATE_FILE=/tmp/parahub_guest_gateway   # tmpfs: reflects runtime, reset each boot
+MODE="$1"
+
+if [ "$MODE" != "on" ] && [ "$MODE" != "off" ]; then
+    echo "usage: $0 on|off" >&2
+    exit 1
+fi
+
+CUR=$(cat "$STATE_FILE" 2>/dev/null)
+[ "$CUR" = "$MODE" ] && exit 0
+
+# Fresh boot: uci-defaults leaves guest DHCP disabled (ignore=1), so a first
+# "off" needs no dnsmasq churn.
+if [ -z "$CUR" ] && [ "$MODE" = "off" ]; then
+    echo off > "$STATE_FILE"
+    exit 0
+fi
+
+if [ "$MODE" = "on" ]; then
+    uci -q delete dhcp.guest.ignore
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart
+    logger -t parahub-guest-gw "elected: guest DHCP ON (terminating the mesh guest VLAN)"
+else
+    uci set dhcp.guest.ignore='1'
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart
+    logger -t parahub-guest-gw "not elected: guest DHCP OFF (relay only)"
+fi
+
+echo "$MODE" > "$STATE_FILE"
