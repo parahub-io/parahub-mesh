@@ -125,18 +125,43 @@ if [ "$WG_OK" = "1" ]; then
         logger -t parahub-gw "Removed stale mesh fallback guest forward rule"
     fi
 
+    # batman-adv's gateway DHCP redirect is NOT VLAN-aware: every gw_mode=client
+    # node unicast-redirects DHCP — including guest (bat0.10) DISCOVERs — to the
+    # batman-elected gw_mode=server, not to the untagged bat0 alone. Only the
+    # elected guest terminator serves guest DHCP, so any OTHER server silently
+    # black-holes guest leases: relay clients hang on "obtaining IP" and roam to
+    # the terminator's own AP (home incident 2026-07-07, two WAN+VPN bumblebees
+    # both became server, clients redirected guest DHCP to the non-terminator).
+    # Gate ONLY gw_mode on being that terminator — identified by guest DHCP being
+    # enabled (dhcp.guest.ignore != 1, toggled by the backend election via
+    # parahub-guest-gateway). A healthy non-terminator uses gw_mode=off so guest
+    # DISCOVERs are never redirected to it (they flood the VLAN and reach the
+    # terminator, or a gw_mode=client node redirects them to the terminator, the
+    # sole server). It KEEPS the anycast IP + mesh return route: gw_mode is
+    # independent of the anycast-based internet-gateway role (nearest server
+    # answers 10.250.250.1, forwarding/masquerade come from the firewall wan
+    # zone), so every WG-healthy bumblebee stays a bee gateway — dropping them
+    # would strand bees routing through a non-terminator.
     CURRENT_MODE=$(batctl gw_mode 2>/dev/null | awk '{print $1}')
-    if [ "$CURRENT_MODE" != "server" ]; then
-        batctl gw_mode server
-        logger -t parahub-gw "WireGuard active, switched to gw_mode=server"
+    if [ "$(uci -q get dhcp.guest.ignore)" != "1" ]; then
+        if [ "$CURRENT_MODE" != "server" ]; then
+            batctl gw_mode server
+            logger -t parahub-gw "guest terminator + WG active → gw_mode=server"
+        fi
+    else
+        if [ "$CURRENT_MODE" != "off" ]; then
+            batctl gw_mode off
+            logger -t parahub-gw "WG active but not guest terminator → gw_mode=off (guest DHCP would black-hole here)"
+        fi
     fi
 
-    # Mesh return route: client nodes have different 10.x.y.0/24 subnets but share
-    # L2 via bat0/br-private. Without this, reply packets to mesh clients go to WAN
-    # instead of back through batman-adv. Lower metric than local /24 routes.
+    # Mesh return route: client nodes have different 10.x.y.0/24 subnets but
+    # share L2 via bat0/br-private. Without this, reply packets to mesh clients
+    # go to WAN instead of back through batman-adv. Lower metric than local /24
+    # routes. Anycast gateway IP: bee nodes discover us via this well-known
+    # address. Both kept regardless of gw_mode — a non-terminator is still an
+    # internet gateway, just not a guest-DHCP redirect target.
     ip route replace 10.0.0.0/8 dev br-private metric 500
-
-    # Anycast gateway IP — bee nodes discover us via this well-known address
     ip addr replace "$ANYCAST_GW/32" dev br-private 2>/dev/null
 
     echo "server" > "$STATE_FILE"

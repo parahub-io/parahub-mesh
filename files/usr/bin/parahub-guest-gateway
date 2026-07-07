@@ -15,10 +15,15 @@
 #
 # The backend heartbeat elects exactly one gateway (only ph35+ bumblebees with
 # an active VPN are eligible) and reports it via the `guest_gateway` flag;
-# parahub-heartbeat calls this helper. batman-adv's gw_mode arbitrates DHCP on
-# the untagged bat0 but NOT on a tagged sub-interface, so a single elected DHCP
-# server is what keeps bumblebees from racing DHCP on the one shared guest VLAN.
-# Only touches dnsmasq when the state actually changes.
+# parahub-heartbeat calls this helper. A single elected DHCP server per island
+# keeps bumblebees from racing DHCP on the one shared guest VLAN. CAUTION:
+# batman-adv's gateway DHCP redirect IS active on the tagged guest VLAN too (it
+# is not VLAN-aware) — a gw_mode=client node unicast-redirects guest DISCOVERs
+# to the batman-elected gw_mode=server. So this election alone is not enough:
+# the elected terminator must also be the ONLY gw_mode=server, else guest DHCP
+# is redirected to a non-terminator and black-holed. parahub-gw-check enforces
+# that (gw_mode=server gated on dhcp.guest.ignore != 1). Only touches dnsmasq
+# when the state actually changes.
 
 STATE_FILE=/tmp/parahub_guest_gateway   # tmpfs: reflects runtime, reset each boot
 MODE="$1"
