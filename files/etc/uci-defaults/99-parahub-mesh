@@ -908,14 +908,20 @@ fi
 # ============================================================================
 
 if [ "$ROLE" != "bee" ]; then
-    # DNS resolver chain (parallel query — dnsmasq picks first responder):
-    #   1. 10.99.0.1   — VPS unbound via vps_gateway WG (no DNS leak; preferred when up)
-    #   2. 127.0.0.1#5053/5054 — DoH (cloudflare/google) via https-dns-proxy as fallback
-    # Without DoH fallback, when vps_gateway is down (no peer / pre-provisioning) DNS dies
-    # entirely and the router becomes unusable for clients.
+    # DNS resolver chain (strict-order — unbound primary, DoH strict fallback):
+    #   1. 10.99.0.1   — VPS unbound via vps_gateway WG (Mullvad-routed, no DNS leak)
+    #   2. 127.0.0.1#5053/5054 — DoH (cloudflare/google) via https-dns-proxy, fallback only
+    # strictorder makes dnsmasq try servers in list order (10.99.0.1 first, DoH only on
+    # timeout) instead of parallel-racing them. Racing leaked ~half of guest DNS to
+    # Cloudflare over the raw WAN (bypassing Mullvad) and let a fast-SERVFAIL'ing unbound
+    # poison results. strict-order keeps guest DNS on the VPN while unbound is up and falls
+    # to DoH only when vps_gateway is down (no peer / pre-provisioning) — without DoH there
+    # DNS dies entirely and the router is unusable. server='10.99.0.1' is add_list'd first
+    # (above the DoH entry https-dns-proxy appends on start), so it stays the primary.
     uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null || true
     uci add_list dhcp.@dnsmasq[0].server='10.99.0.1'
     uci set dhcp.@dnsmasq[0].noresolv='1'
+    uci set dhcp.@dnsmasq[0].strictorder='1'
     uci commit dhcp
 
     # https-dns-proxy auto-injects 127.0.0.1#5053/5054 into dnsmasq config on start.

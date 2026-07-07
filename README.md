@@ -18,13 +18,13 @@ Two node roles:
 
 | Role | Function | Packages | Devices |
 |------|----------|----------|---------|
-| **Bumblebee** | L3 Gateway — full stack | batman-adv, Yggdrasil, WireGuard, tc, DoH | AXT1800, MT3000, MT6000, AX53U |
+| **Bumblebee** | L3 Gateway — full stack | batman-adv, Yggdrasil, WireGuard, tc, DoH | AXT1800, MT3000, MT6000, AX53U, AP3000 Outdoor |
 | **Bee** | L2 Transport — mesh relay | batman-adv, Yggdrasil | AR300M16, CPE710 |
 
 ### Network layout per node
 
 - **Private WiFi** (`Parahub`, 5GHz) — WPA3/SAE, 802.11r/k/v seamless roaming across all nodes
-- **Public WiFi** (`parahub.io/free`, 2.4GHz) — OWE encrypted, guest-isolated on Bumblebees
+- **Public WiFi** (`parahub.io/free`, 2.4GHz) — open network, client-isolated (guest-isolated on Bumblebees)
 - **Mesh backhaul** (802.11s on both bands) — SAE-encrypted, batman-adv BATMAN_V routing
 - **Yggdrasil overlay** — IPv6 management plane, OTA updates, Parahub services at full speed
 
@@ -44,6 +44,7 @@ VPN tunnel is auto-configured via heartbeat API. DNS is forwarded through VPN (n
 | GL.iNet GL-MT3000 (Beryl AX) | mediatek/filogic | Bumblebee | WiFi 6, compact |
 | GL.iNet GL-MT6000 (Flint 2) | mediatek/filogic | Bumblebee | WiFi 6, 1GB RAM |
 | Asus RT-AX53U | ramips/mt7621 | Bumblebee | WiFi 6, DSA switch |
+| Cudy AP3000 Outdoor V1 | mediatek/filogic | Bumblebee | WiFi 6 dual-band, outdoor IP65, single PoE |
 | GL.iNet GL-AR300M16 (16MB) | ath79/generic | Bee | Tiny, 2.4GHz only |
 | TP-Link CPE710 v1 | ath79/generic | Bee | 5GHz outdoor, 23dBi directional |
 
@@ -124,6 +125,7 @@ Every 5 minutes, nodes phone home to the Parahub API with status (uptime, client
 | `parahub-speed-control` | Per-client bandwidth shaping on guest network |
 | `parahub-vps-setup` | WireGuard tunnel configuration (called by heartbeat) |
 | `parahub-mullvad` | Optional Mullvad VPN for lower-latency guest exit |
+| `parahub-ygg-acl` | Yggdrasil inbound access control (nftables whitelist) |
 
 ## License
 
