@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 OPENWRT_VERSION="${OPENWRT_VERSION:-25.12.5}"
-PARAHUB_BUILD="${PARAHUB_BUILD:-39}"
+PARAHUB_BUILD="${PARAHUB_BUILD:-44}"
 FIRMWARE_VERSION="${OPENWRT_VERSION}-ph${PARAHUB_BUILD}"
 
 # Where built images + manifest land. Override (OUTPUT_DIR=/path ./build.sh ...)

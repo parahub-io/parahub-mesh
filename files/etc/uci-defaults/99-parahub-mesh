@@ -11,6 +11,23 @@
 ROLE=$(cat /etc/parahub/role 2>/dev/null || echo "bumblebee")
 
 # ============================================================================
+# 0. SYSUPGRADE KEEP-LIST SYNC
+# ============================================================================
+# /etc/sysupgrade.conf is itself preserved across sysupgrade, so a deployed
+# node keeps the keep-list of whatever firmware it was FIRST flashed with —
+# entries added to the shipped list later never reach it, and their files
+# silently vanish on the next OTA (this dropped a node's Mullvad marker and
+# kicked its guests back to the VPS exit). Union-merge the shipped ROM copy
+# into the live file: canonical entries propagate, node-local additions
+# survive.
+if [ -f /rom/etc/sysupgrade.conf ]; then
+    while IFS= read -r line; do
+        case "$line" in ''|'#'*) continue ;; esac
+        grep -qxF "$line" /etc/sysupgrade.conf 2>/dev/null || echo "$line" >> /etc/sysupgrade.conf
+    done < /rom/etc/sysupgrade.conf
+fi
+
+# ============================================================================
 # 1. IDENTITY GENERATION
 # ============================================================================
 
@@ -878,6 +895,8 @@ mkdir -p /etc/hotplug.d/iface
 cat > /etc/hotplug.d/iface/30-parahub-speed <<'HOTEOF'
 #!/bin/sh
 [ "$ACTION" = ifup ] || exit 0
+# Respect the owner's speed-limit toggle (/iot → parahub-speed disable)
+/etc/init.d/parahub-speed enabled 2>/dev/null || exit 0
 role=$(cat /etc/parahub/role 2>/dev/null || echo bumblebee)
 if [ "$role" = bee ]; then
     [ "$INTERFACE" = private ] || exit 0

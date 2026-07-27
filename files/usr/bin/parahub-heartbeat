@@ -50,10 +50,26 @@ esac
 
 FW_VERSION=$(cat /etc/parahub/version 2>/dev/null || echo "unknown")
 
-# Detect VPN mode
+# Detect VPN mode — freshness-based (ph42). A `wg show` handshake line is a
+# timestamp, not liveness: it persists forever after the last handshake, and
+# the mullvad marker file only means "configured". Report a mode only when the
+# active tunnel has a handshake younger than 5 min (same bar as
+# parahub-gw-check), so the backend guest-gateway election reacts to a dead
+# VPN within one heartbeat instead of waiting for a reboot.
 VPN_MODE="none"
-[ -f /etc/parahub/mullvad_account ] && VPN_MODE="mullvad"
-[ "$VPN_MODE" = "none" ] && wg show vps_gateway 2>/dev/null | grep -q 'latest handshake' && VPN_MODE="vps"
+VPN_IF="vps_gateway"
+[ -f /etc/parahub/mullvad_account ] && VPN_IF="mullvad_local"
+LAST_HS=$(wg show "$VPN_IF" latest-handshakes 2>/dev/null | awk '{print $NF}' | sort -rn | head -1)
+if [ -n "$LAST_HS" ] && [ "$LAST_HS" -gt 0 ] 2>/dev/null; then
+    HS_AGE=$(( $(date +%s) - LAST_HS ))
+    if [ "$HS_AGE" -lt 300 ]; then
+        if [ "$VPN_IF" = "mullvad_local" ]; then
+            VPN_MODE="mullvad"
+        else
+            VPN_MODE="vps"
+        fi
+    fi
+fi
 
 # Mesh topology for per-island guest-gateway election (ph37): this node's own
 # mesh interface MACs + every originator MAC it sees. batctl o is the full
@@ -69,7 +85,56 @@ MESH_ORIGINATORS=$(batctl o 2>/dev/null | awk '
     { mac = ($1 == "*") ? $2 : $1
       if (mac ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/ && !seen[mac]++) printf "%s\"%s\"", (n++ ? "," : ""), mac }')
 
-PAYLOAD="{\"mac\":\"${MAC}\",\"hostname\":\"${HOSTNAME}\",\"yggdrasil_address\":\"${YGG_ADDR}\",\"firmware_version\":\"${FW_VERSION}\",\"hardware_profile\":\"${HW}\",\"uptime\":${UPTIME},\"private_ssid\":\"${SSID}\",\"firmware_role\":\"${ROLE}\",\"mesh_ip\":\"${MESH_IP}\",\"wg_public_key\":\"${WG_PUBKEY}\",\"vpn_mode\":\"${VPN_MODE}\",\"mesh_macs\":[${MESH_MACS}],\"mesh_originators\":[${MESH_ORIGINATORS}]}"
+# Guest DHCP leases (ph40+): MAC↔IP pairs on the guest subnet, so the backend
+# can translate bound device MACs into this node's paid_clients IPs. The lease
+# file mixes private and guest pools — filter by the guest /24. Only the
+# guest-VLAN terminator has guest leases; everyone else sends an empty list.
+GUEST_LEASES=""
+if [ "$ROLE" != "bee" ] && [ -f /tmp/dhcp.leases ]; then
+    GUEST_PREFIX=$(uci -q get network.guest.ipaddr | awk -F. 'NF==4 {print $1"."$2"."$3"."}')
+    if [ -n "$GUEST_PREFIX" ]; then
+        GUEST_LEASES=$(awk -v p="$GUEST_PREFIX" 'index($3, p) == 1 {
+            host = ($4 == "*") ? "" : $4
+            gsub(/[^A-Za-z0-9._-]/, "", host)
+            printf "%s{\"mac\":\"%s\",\"ip\":\"%s\",\"host\":\"%s\"}", (n++ ? "," : ""), $2, $3, host }' /tmp/dhcp.leases)
+    fi
+fi
+
+# Telemetry counters (ph41+): raw byte counters — the backend derives rates
+# from consecutive heartbeats (uptime detects reboots/counter resets).
+# Uplink = default-route device (a bee's mesh default lands on br-private,
+# which is its honest uplink).
+WAN_DEV=$(ip route 2>/dev/null | grep '^default' | head -1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+[ -z "$WAN_DEV" ] && WAN_DEV=bat0
+WAN_RX=$(cat "/sys/class/net/${WAN_DEV}/statistics/rx_bytes" 2>/dev/null || echo 0)
+WAN_TX=$(cat "/sys/class/net/${WAN_DEV}/statistics/tx_bytes" 2>/dev/null || echo 0)
+LOAD_1M=$(cut -d' ' -f1 /proc/loadavg)
+LOAD_1M="${LOAD_1M:-0}"
+MEM_TOTAL=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+MEM_AVAIL=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+MEM_TOTAL="${MEM_TOTAL:-0}"
+MEM_AVAIL="${MEM_AVAIL:-0}"
+
+# WiFi clients + free-AP usage: walk AP (Master) VAPs only — mesh-point
+# interfaces list mesh peers in assoclist and must not count as clients.
+# Guest VAPs are identified by the fleet-wide shared free ESSID.
+WIFI_CLIENTS=0; GUEST_CLIENTS=0; GUEST_RX=0; GUEST_TX=0
+for W in $(iwinfo 2>/dev/null | awk '/ESSID/ {print $1}'); do
+    iwinfo "$W" info 2>/dev/null | grep -q 'Mode: Master' || continue
+    N=$(iwinfo "$W" assoclist 2>/dev/null | grep -c '^[0-9A-Fa-f][0-9A-Fa-f]:')
+    ESSID=$(iwinfo "$W" info 2>/dev/null | sed -n 's/.*ESSID: "\(.*\)".*/\1/p')
+    if [ "$ESSID" = "parahub.io/free" ]; then
+        GUEST_CLIENTS=$((GUEST_CLIENTS + N))
+        GUEST_RX=$((GUEST_RX + $(cat "/sys/class/net/${W}/statistics/rx_bytes" 2>/dev/null || echo 0)))
+        GUEST_TX=$((GUEST_TX + $(cat "/sys/class/net/${W}/statistics/tx_bytes" 2>/dev/null || echo 0)))
+    else
+        WIFI_CLIENTS=$((WIFI_CLIENTS + N))
+    fi
+done
+
+STATS="{\"uplink_dev\":\"${WAN_DEV}\",\"wan_rx\":${WAN_RX},\"wan_tx\":${WAN_TX},\"guest_rx\":${GUEST_RX},\"guest_tx\":${GUEST_TX},\"wifi_clients\":${WIFI_CLIENTS},\"guest_clients\":${GUEST_CLIENTS},\"load_1m\":${LOAD_1M},\"mem_total\":${MEM_TOTAL},\"mem_avail\":${MEM_AVAIL}}"
+
+PAYLOAD="{\"mac\":\"${MAC}\",\"hostname\":\"${HOSTNAME}\",\"yggdrasil_address\":\"${YGG_ADDR}\",\"firmware_version\":\"${FW_VERSION}\",\"hardware_profile\":\"${HW}\",\"uptime\":${UPTIME},\"private_ssid\":\"${SSID}\",\"firmware_role\":\"${ROLE}\",\"mesh_ip\":\"${MESH_IP}\",\"wg_public_key\":\"${WG_PUBKEY}\",\"vpn_mode\":\"${VPN_MODE}\",\"mesh_macs\":[${MESH_MACS}],\"mesh_originators\":[${MESH_ORIGINATORS}],\"guest_leases\":[${GUEST_LEASES}],\"stats\":${STATS}}"
 
 RESPONSE=""
 
@@ -162,6 +227,37 @@ else
     fi
 fi
 
+# Speed-tier rates (ph44): owner-set budgets from the backend — per-guest free
+# tier (guest_kbps, applied where this node terminates the guest VLAN) and the
+# host budget (host_mbps, the bat0 cap a bee/fallback node lives under, min
+# over the island's donors). Persisted so boot-time hotplug shaping uses the
+# last known values; a change re-applies the affected shaper immediately.
+SPEED_ENABLED=0
+/etc/init.d/parahub-speed enabled 2>/dev/null && SPEED_ENABLED=1
+if [ -x /usr/bin/parahub-speed-control ] && [ -n "$RESPONSE" ]; then
+    GUEST_KBPS=$(echo "$RESPONSE" | jsonfilter -e '$.rates.guest_kbps' 2>/dev/null)
+    HOST_MBPS=$(echo "$RESPONSE" | jsonfilter -e '$.rates.host_mbps' 2>/dev/null)
+    case "$GUEST_KBPS" in ''|*[!0-9]*) GUEST_KBPS="" ;; esac
+    case "$HOST_MBPS" in ''|*[!0-9]*) HOST_MBPS="" ;; esac
+    if [ -n "$GUEST_KBPS" ] && [ "$(cat /etc/parahub/guest_rate_kbps 2>/dev/null)" != "$GUEST_KBPS" ]; then
+        echo "$GUEST_KBPS" > /etc/parahub/guest_rate_kbps
+        if [ "$ROLE" != "bee" ] && [ "$SPEED_ENABLED" = "1" ]; then
+            logger -t parahub-heartbeat "Guest rate changed to ${GUEST_KBPS} kbps, re-applying guest shaping"
+            parahub-speed-control init
+        fi
+    fi
+    if [ -n "$HOST_MBPS" ] && [ "$(cat /etc/parahub/host_rate_mbps 2>/dev/null)" != "$HOST_MBPS" ]; then
+        echo "$HOST_MBPS" > /etc/parahub/host_rate_mbps
+        if [ "$ROLE" = "bee" ]; then
+            [ "$SPEED_ENABLED" = "1" ] && parahub-speed-control init_host
+        elif tc qdisc show dev bat0 2>/dev/null | grep -q '^qdisc htb'; then
+            # Bumblebee with an active mesh-fallback cap: refresh it
+            parahub-speed-control init_host
+        fi
+        logger -t parahub-heartbeat "Host budget changed to ${HOST_MBPS} Mbps"
+    fi
+fi
+
 # Sync paid_clients to speed control (Bumblebee only)
 if [ "$ROLE" != "bee" ] && [ -x /usr/bin/parahub-speed-control ] && [ -n "$RESPONSE" ]; then
     PAID_IPS=$(echo "$RESPONSE" | jsonfilter -e '$.paid_clients[*]' 2>/dev/null)
@@ -170,6 +266,13 @@ if [ "$ROLE" != "bee" ] && [ -x /usr/bin/parahub-speed-control ] && [ -n "$RESPO
     for IP in $PAID_IPS; do
         parahub-speed-control add "$IP"
     done
+fi
+
+# Per-guest shaping classes track DHCP leases (ph44): give every current guest
+# lease its own class so the free tier is per guest, not shared. No-op unless
+# guest shaping is applied and the lease set / rate actually changed.
+if [ "$ROLE" != "bee" ] && [ "$SPEED_ENABLED" = "1" ] && [ -x /usr/bin/parahub-speed-control ]; then
+    parahub-speed-control sync_guests
 fi
 
 # Sync Yggdrasil ACL whitelist (Bumblebee only)
@@ -202,5 +305,36 @@ if [ "$ROLE" != "bee" ] && [ -n "$RESPONSE" ] && [ ! -f /etc/parahub/mullvad_acc
 
     if [ -n "$VPS_ENDPOINT" ] && [ -n "$VPS_PUBKEY" ] && [ -n "$VPS_IP" ]; then
         /usr/bin/parahub-vps-setup "$VPS_ENDPOINT" "$VPS_PUBKEY" "$VPS_IP" "${VPS_KEEPALIVE:-25}"
+    fi
+fi
+
+# Yggdrasil inbound self-heal (ph42, all roles). The backend TCP-probes this
+# node's ygg:22 every 2 min and sets ygg_inbound_dead in the reply once a
+# failure streak is confirmed — the wedge where outbound (heartbeats) works
+# but inbound times out, leaving the node unmanageable. Previously the only
+# cure was a human power cycle; these nodes are meant to be unattended.
+# Escalation ladder on consecutive flagged heartbeats: 2nd -> restart
+# yggdrasil, 5th (~15 min after the soft attempt) -> reboot. Guards: no
+# action in the first 10 min of uptime (boot grace), reboot only past 30 min
+# uptime (loop brake); an absent/false flag resets the streak, and the
+# backend verdict TTLs out if its probe timer dies, so a stale "dead" can
+# never keep cycling a healthy node. The flag also arrives via the public
+# API fallback, so a fully dead yggdrasil still gets healed.
+HEAL_STATE=/tmp/parahub-ygg-heal.count
+if [ -n "$RESPONSE" ]; then
+    INBOUND_DEAD=$(echo "$RESPONSE" | jsonfilter -e '$.ygg_inbound_dead' 2>/dev/null)
+    if [ "$INBOUND_DEAD" = "true" ] && [ "$UPTIME" -gt 600 ]; then
+        STREAK=$(( $(cat "$HEAL_STATE" 2>/dev/null || echo 0) + 1 ))
+        echo "$STREAK" > "$HEAL_STATE"
+        logger -t parahub-heartbeat "Backend reports ygg inbound dead (streak $STREAK)"
+        if [ "$STREAK" = "2" ]; then
+            logger -t parahub-heartbeat "Self-heal: restarting yggdrasil"
+            /etc/init.d/yggdrasil restart
+        elif [ "$STREAK" -ge 5 ] && [ "$UPTIME" -gt 1800 ]; then
+            logger -t parahub-heartbeat "Self-heal: yggdrasil restart did not recover inbound, rebooting"
+            reboot
+        fi
+    else
+        rm -f "$HEAL_STATE"
     fi
 fi

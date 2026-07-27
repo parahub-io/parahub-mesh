@@ -89,6 +89,23 @@ remove_guest_forward_rule() {
     done
 }
 
+# ---- Host budget cap during mesh fallback (ph44) ----
+# In mesh_fallback this node's own private (and SNAT'd guest) traffic rides
+# another island member's uplink — the same freeride a bee's bat0 cap bounds.
+# Apply the identical host budget here; without it a WAN-less bumblebee is an
+# uncapped bee. Asserted every fallback tick, removed in server/isolated.
+ensure_host_cap() {
+    tc qdisc show dev bat0 2>/dev/null | grep -q '^qdisc htb' && return
+    /usr/bin/parahub-speed-control init_host
+    logger -t parahub-gw "Mesh fallback: host budget cap applied on bat0"
+}
+
+drop_host_cap() {
+    tc qdisc show dev bat0 2>/dev/null | grep -q '^qdisc htb' || return
+    /usr/bin/parahub-speed-control stop_host
+    logger -t parahub-gw "Left mesh fallback: host budget cap removed"
+}
+
 # ---- Cleanup mesh fallback routing ----
 cleanup_mesh_fallback() {
     local old_gw
@@ -164,6 +181,7 @@ if [ "$WG_OK" = "1" ]; then
     ip route replace 10.0.0.0/8 dev br-private metric 500
     ip addr replace "$ANYCAST_GW/32" dev br-private 2>/dev/null
 
+    drop_host_cap
     echo "server" > "$STATE_FILE"
     exit 0
 fi
@@ -191,6 +209,7 @@ if [ -z "$GW_MAC" ]; then
     elif guest_forward_rule_present; then
         remove_guest_forward_rule
     fi
+    drop_host_cap
     echo "isolated" > "$STATE_FILE"
     exit 0
 fi
@@ -219,6 +238,7 @@ if ! ping -c 1 -W 2 "$GW_IP" >/dev/null 2>&1; then
         elif guest_forward_rule_present; then
             remove_guest_forward_rule
         fi
+        drop_host_cap
         logger -t parahub-gw "Mesh gateway unreachable (MAC-derived + anycast), skipping fallback"
         echo "isolated" > "$STATE_FILE"
         exit 0
@@ -260,6 +280,7 @@ nft flush chain inet mesh_gw_fallback postrouting 2>/dev/null
 [ -n "$PRIVATE_SUBNET" ] && nft add rule inet mesh_gw_fallback postrouting oifname "br-private" ip saddr "$PRIVATE_SUBNET" masquerade
 
 install_guest_forward_rule
+ensure_host_cap
 
 if [ "$CURRENT_STATE" != "mesh_fallback" ] || [ "$OLD_GW" != "$GW_IP" ]; then
     # Restart DoH proxy — it may have stopped when WAN was down.

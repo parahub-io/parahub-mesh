@@ -1,17 +1,35 @@
 #!/bin/sh
 # Parahub Mesh — Speed control
-# Guest mode (Bumblebee): 512kbps free tier, paid upgrade via Lightning
-# Host mode (Bee): 10Mbps total on private network for mesh node hosts
+# Guest mode (Bumblebee): per-guest free tier, paid upgrade via Lightning
+# Host mode (Bee / bumblebee in mesh fallback): host budget on bat0 —
+#   total cap for this node's private traffic riding a donor's uplink
 #
-# Usage: parahub-speed-control init|init_host|stop_host|add <ip>|remove <ip>|list|flush
+# Rates are owner policy, delivered by the backend via heartbeat and persisted
+# in /etc/parahub/{guest_rate_kbps,host_rate_mbps}; defaults apply until the
+# first heartbeat after boot/OTA.
+#
+# Usage: parahub-speed-control init|sync_guests|init_host|stop_host|add <ip>|remove <ip>|list|flush
 
-SLOW_RATE="512kbit"
-HOST_RATE="10mbit"
+GUEST_RATE_KBPS=$(cat /etc/parahub/guest_rate_kbps 2>/dev/null)
+case "$GUEST_RATE_KBPS" in ''|*[!0-9]*) GUEST_RATE_KBPS=512 ;; esac
+[ "$GUEST_RATE_KBPS" -gt 0 ] || GUEST_RATE_KBPS=512
+
+HOST_RATE_MBPS=$(cat /etc/parahub/host_rate_mbps 2>/dev/null)
+case "$HOST_RATE_MBPS" in ''|*[!0-9]*) HOST_RATE_MBPS=10 ;; esac
+[ "$HOST_RATE_MBPS" -gt 0 ] || HOST_RATE_MBPS=10
+
+SLOW_RATE="${GUEST_RATE_KBPS}kbit"
+HOST_RATE="${HOST_RATE_MBPS}mbit"
+GUEST_SYNC_STATE="/tmp/parahub-guest-shape.state"
+
+guest_iface() {
+    ubus call network.interface.guest status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null
+}
 
 case "$1" in
   init)
     # --- Guest speed control (Bumblebee) ---
-    IFACE=$(ubus call network.interface.guest status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+    IFACE=$(guest_iface)
     if [ -z "$IFACE" ]; then
         logger -t parahub-speed "Error: guest interface not found, speed control disabled"
         exit 1
@@ -22,16 +40,23 @@ case "$1" in
     /etc/init.d/sqm disable 2>/dev/null
 
     # --- Egress shaping (router → client, i.e. download for client) ---
+    # Class layout: 1:10 default (free tier, shared only by guests whose
+    # per-IP class hasn't been synced yet — sync_guests gives every DHCP
+    # lease its own class so the advertised rate is per guest, not shared),
+    # 1:20 unlimited (paid + IPv6), 1:4xx per-guest (minor = 0x400 + last
+    # octet of the lease IP).
+    # Filter prios matter: 1 = IPv6 exempt, 2 = paid fw-mark (must win over
+    # the per-IP classes), 5 = per-guest u32.
     tc qdisc del dev $IFACE root 2>/dev/null
     tc qdisc add dev $IFACE root handle 1: htb default 10
     tc class add dev $IFACE parent 1: classid 1:1 htb rate 1000mbit
-    tc class add dev $IFACE parent 1:1 classid 1:10 htb rate $SLOW_RATE ceil $SLOW_RATE  # free tier
+    tc class add dev $IFACE parent 1:1 classid 1:10 htb rate $SLOW_RATE ceil $SLOW_RATE  # free tier (unsynced)
     tc class add dev $IFACE parent 1:1 classid 1:20 htb rate 1000mbit                     # paid tier
     tc qdisc add dev $IFACE parent 1:10 fq_codel
     tc qdisc add dev $IFACE parent 1:20 fq_codel
 
     # tc filter: packets with mark 0x20 → paid class
-    tc filter add dev $IFACE parent 1: protocol ip handle 0x20 fw flowid 1:20
+    tc filter add dev $IFACE parent 1: protocol ip prio 2 handle 0x20 fw flowid 1:20
 
     # Exempt ALL IPv6 from shaping — only Yggdrasil IPv6 reaches guests (firewall enforced)
     tc filter add dev $IFACE parent 1: protocol ipv6 prio 1 u32 match u32 0 0 flowid 1:20
@@ -51,7 +76,7 @@ case "$1" in
     tc class add dev ifb-guest parent 1:1 classid 1:20 htb rate 1000mbit
     tc qdisc add dev ifb-guest parent 1:10 fq_codel
     tc qdisc add dev ifb-guest parent 1:20 fq_codel
-    tc filter add dev ifb-guest parent 1: protocol ip handle 0x20 fw flowid 1:20
+    tc filter add dev ifb-guest parent 1: protocol ip prio 2 handle 0x20 fw flowid 1:20
 
     # Exempt ALL IPv6 from ingress shaping
     tc filter add dev ifb-guest parent 1: protocol ipv6 prio 1 u32 match u32 0 0 flowid 1:20
@@ -64,11 +89,59 @@ case "$1" in
     nft add rule inet parahub speed_mark ip daddr @paid_clients meta mark set 0x20
     nft add rule inet parahub speed_mark ip saddr @paid_clients meta mark set 0x20
 
-    logger -t parahub-speed "Speed control initialized: free=${SLOW_RATE}, paid=unlimited"
+    # Per-guest classes were wiped with the root qdisc — force a resync
+    rm -f "$GUEST_SYNC_STATE"
+    "$0" sync_guests
+
+    logger -t parahub-speed "Speed control initialized: free=${SLOW_RATE}/guest, paid=unlimited"
+    ;;
+
+  sync_guests)
+    # --- Per-guest class sync (Bumblebee, called from init + every heartbeat) ---
+    # One HTB class + u32 filter pair per guest DHCP lease, so each guest gets
+    # SLOW_RATE for itself instead of all free guests sharing one class. New
+    # joiners ride the shared default class 1:10 until the next sync (≤5 min).
+    # Paid clients keep full speed regardless: the fw-mark filter at prio 2 is
+    # checked before the per-IP filters at prio 5.
+    IFACE=$(guest_iface)
+    [ -n "$IFACE" ] || exit 0
+    tc qdisc show dev "$IFACE" 2>/dev/null | grep -q '^qdisc htb' || exit 0
+
+    GUEST_PREFIX=$(uci -q get network.guest.ipaddr | awk -F. 'NF==4 {print $1"."$2"."$3"."}')
+    [ -n "$GUEST_PREFIX" ] || exit 0
+    LEASE_IPS=$(awk -v p="$GUEST_PREFIX" 'index($3, p) == 1 {print $3}' /tmp/dhcp.leases 2>/dev/null | sort -u)
+
+    NEW_STATE="rate=${GUEST_RATE_KBPS} $(echo $LEASE_IPS)"
+    [ "$(cat "$GUEST_SYNC_STATE" 2>/dev/null)" = "$NEW_STATE" ] && exit 0
+
+    # Rebuild the per-guest layer: drop all prio-5 filters in one shot, remove
+    # classes for IPs that no longer hold a lease, (re)create the rest.
+    tc filter del dev "$IFACE" parent 1: prio 5 2>/dev/null
+    tc filter del dev ifb-guest parent 1: prio 5 2>/dev/null
+    OLD_IPS=$(cat "$GUEST_SYNC_STATE" 2>/dev/null | tr ' ' '\n' | grep -v '^rate=')
+    for IP in $OLD_IPS; do
+        echo "$LEASE_IPS" | grep -qx "$IP" && continue
+        H=$(printf '%x' $((1024 + ${IP##*.})))
+        tc class del dev "$IFACE" classid 1:$H 2>/dev/null
+        tc class del dev ifb-guest classid 1:$H 2>/dev/null
+    done
+    N=0
+    for IP in $LEASE_IPS; do
+        H=$(printf '%x' $((1024 + ${IP##*.})))
+        tc class replace dev "$IFACE" parent 1:1 classid 1:$H htb rate $SLOW_RATE ceil $SLOW_RATE
+        tc qdisc replace dev "$IFACE" parent 1:$H fq_codel 2>/dev/null
+        tc filter add dev "$IFACE" parent 1: protocol ip prio 5 u32 match ip dst $IP/32 flowid 1:$H
+        tc class replace dev ifb-guest parent 1:1 classid 1:$H htb rate $SLOW_RATE ceil $SLOW_RATE
+        tc qdisc replace dev ifb-guest parent 1:$H fq_codel 2>/dev/null
+        tc filter add dev ifb-guest parent 1: protocol ip prio 5 u32 match ip src $IP/32 flowid 1:$H
+        N=$((N + 1))
+    done
+    echo "$NEW_STATE" > "$GUEST_SYNC_STATE"
+    logger -t parahub-speed "Guest classes synced: $N leases at ${SLOW_RATE} each"
     ;;
 
   init_host)
-    # --- Host speed control (Bee) ---
+    # --- Host speed control (Bee, or Bumblebee in mesh fallback) ---
     # Shapes all local ↔ mesh traffic on bat0 to HOST_RATE total.
     # bat0 is the batman-adv soft interface — single chokepoint for local traffic.
     # Relay traffic between hardifs (mesh0/mesh1) stays inside batman-adv — NOT affected.
@@ -128,7 +201,7 @@ case "$1" in
     nft flush set inet parahub paid_clients 2>/dev/null
     ;;
   *)
-    echo "Usage: $0 {init|init_host|stop_host|add <ip>|remove <ip>|list|flush}"
+    echo "Usage: $0 {init|sync_guests|init_host|stop_host|add <ip>|remove <ip>|list|flush}"
     exit 1
     ;;
 esac

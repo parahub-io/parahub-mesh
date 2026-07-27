@@ -2,6 +2,8 @@
 
 Custom OpenWrt firmware for self-organizing mesh networks using **batman-adv** (L2) and **Yggdrasil** (overlay). Nodes auto-configure on first boot with zero manual setup.
 
+**[Firmware & downloads](https://parahub.io/mesh)** · **[Live coverage map](https://parahub.io/map?fit=mesh)** · **[Documentation](https://parahub.io/docs/mesh)** · **[Getting started (A4)](https://parahub.io/print/mesh.html)** · **[Peering agreement](PEERING.md)**
+
 ## Architecture
 
 ```
@@ -90,6 +92,21 @@ sysupgrade -v /tmp/openwrt-*-sysupgrade.bin
 
 Or via LuCI web UI: System > Backup/Flash Firmware.
 
+## After flashing — getting started
+
+First boot is zero-touch: the node configures itself, meshes with any Parahub node in
+radio range and appears in [parahub.io/iot](https://parahub.io/iot) within ~5 minutes.
+
+For the host/installer side — node roles, which port takes the internet on each device,
+cabling do & don't, WiFi networks, address recognition, speed tiers and human-level
+troubleshooting — see the one-page getting-started sheet:
+
+- **Live version** (always current): <https://parahub.io/print/mesh.html>
+- **Offline copy** (synced on every release): [`docs/getting-started.html`](docs/getting-started.html) — open in a browser; Ctrl+P prints it as a single A4.
+
+The sheet describes a node operating inside the Parahub fleet (managed from
+parahub.io/iot). If you run your own backend, read it as the reference deployment.
+
 ## How it works
 
 ### Zero-touch first boot
@@ -127,6 +144,18 @@ Every 5 minutes, nodes phone home to the Parahub API with status (uptime, client
 | `parahub-mullvad` | Optional Mullvad VPN for lower-latency guest exit |
 | `parahub-ygg-acl` | Yggdrasil inbound access control (nftables whitelist) |
 
+## Peering Agreement
+
+The firmware source is [MIT](LICENSE) licensed. The *network* — the free transit that
+nodes donate to each other and to guests — follows the
+[Parahub Mesh Peering Agreement](PEERING.md), adopted from the
+[Pico Peering Agreement v1.0](https://picopeer.net) (CC0).
+
+That agreement is a **draft pending legal review and is not yet in force**: it states how
+the mesh is meant to work and how guest data is handled, and it binds no node owner until
+a final version is adopted. What a node reports about itself and about connected guests is
+described in section 5.7 and in the [Privacy Policy](https://parahub.io/about/privacy).
+
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — firmware source code. See [PEERING.md](PEERING.md) for the network peering terms.
